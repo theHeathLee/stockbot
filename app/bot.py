@@ -1,10 +1,11 @@
 """
-X → Telegram Stock/Finance Alert Bot
-Polls a target X account, uses Claude AI to classify tweets,
+X + Truth Social → Telegram Stock/Finance Alert Bot
+Polls target accounts on both platforms, uses Claude AI to classify posts,
 and forwards finance-relevant ones to a Telegram chat.
 """
 
 import os
+import re
 import json
 import time
 import logging
@@ -21,36 +22,37 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ── Config from environment ──────────────────────────────────────────────────
-TWITTER_API_KEY   = os.environ["TWITTER_API_KEY"]       # twitterapi.io key
-ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]     # Anthropic key
-TELEGRAM_TOKEN    = os.environ["TELEGRAM_BOT_TOKEN"]    # BotFather token
-TELEGRAM_CHAT_ID  = os.environ["TELEGRAM_CHAT_ID"]      # Target chat/channel ID
-TARGET_USERNAME   = os.environ["TARGET_X_USERNAME"]     # e.g. "elonmusk" (no @)
-POLL_INTERVAL     = int(os.getenv("POLL_INTERVAL_SECONDS", "300"))  # default 5 min
+TWITTER_API_KEY   = os.environ["TWITTER_API_KEY"]
+ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
+TELEGRAM_TOKEN    = os.environ["TELEGRAM_BOT_TOKEN"]
+TELEGRAM_CHAT_ID  = os.environ["TELEGRAM_CHAT_ID"]
+TARGET_X_USERNAME = os.environ["TARGET_X_USERNAME"]
+TARGET_TS_USERNAME = os.getenv("TARGET_TRUTH_SOCIAL_USERNAME", "")
+POLL_INTERVAL     = int(os.getenv("POLL_INTERVAL_SECONDS", "300"))
 
-STATE_FILE = Path("/data/last_tweet_id.json")
+STATE_FILE = Path("/data/state.json")
 
-# ── Persistence: track the last seen tweet ID ────────────────────────────────
+# ── Persistence ──────────────────────────────────────────────────────────────
 
-def load_last_id() -> str | None:
+def load_state() -> dict:
     if STATE_FILE.exists():
         try:
-            return json.loads(STATE_FILE.read_text()).get("last_id")
+            return json.loads(STATE_FILE.read_text())
         except Exception:
             pass
-    return None
+    return {}
 
-def save_last_id(tweet_id: str):
+def save_state(state: dict):
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    STATE_FILE.write_text(json.dumps({"last_id": tweet_id}))
+    STATE_FILE.write_text(json.dumps(state))
 
 # ── X / twitterapi.io ────────────────────────────────────────────────────────
 
-_user_id_cache: dict[str, str] = {}
+_twitter_user_id_cache: dict[str, str] = {}
 
-def resolve_user_id(username: str) -> str | None:
-    if username in _user_id_cache:
-        return _user_id_cache[username]
+def resolve_twitter_user_id(username: str) -> str | None:
+    if username in _twitter_user_id_cache:
+        return _twitter_user_id_cache[username]
     try:
         resp = requests.get(
             "https://api.twitterapi.io/twitter/user/info",
@@ -61,45 +63,94 @@ def resolve_user_id(username: str) -> str | None:
         resp.raise_for_status()
         user_id = resp.json().get("data", {}).get("id")
         if user_id:
-            _user_id_cache[username] = user_id
+            _twitter_user_id_cache[username] = user_id
         return user_id
     except requests.RequestException as e:
-        log.error(f"Failed to resolve user ID for @{username}: {e}")
+        log.error(f"Failed to resolve Twitter user ID for @{username}: {e}")
         return None
 
-def fetch_recent_tweets(username: str, since_id: str | None) -> list[dict]:
-    """
-    Fetch the latest tweets from a user's timeline via twitterapi.io.
-    Returns tweets in chronological order (oldest first).
-    """
-    user_id = resolve_user_id(username)
+def fetch_tweets(username: str, since_id: str | None) -> list[dict]:
+    user_id = resolve_twitter_user_id(username)
     if not user_id:
-        log.error(f"Cannot fetch tweets — no user ID for @{username}")
         return []
 
-    url = "https://api.twitterapi.io/twitter/user/tweet_timeline"
     params = {"userId": user_id, "count": 20}
     if since_id:
         params["sinceId"] = since_id
 
-    headers = {"X-API-Key": TWITTER_API_KEY}
-
     try:
-        resp = requests.get(url, params=params, headers=headers, timeout=15)
+        resp = requests.get(
+            "https://api.twitterapi.io/twitter/user/tweet_timeline",
+            params=params,
+            headers={"X-API-Key": TWITTER_API_KEY},
+            timeout=15,
+        )
         resp.raise_for_status()
-        data = resp.json()
+        tweets = resp.json().get("data", {}).get("tweets", [])
     except requests.RequestException as e:
         log.error(f"Twitter API request failed: {e}")
         return []
 
-    tweets = data.get("data", {}).get("tweets", [])
-    # Return oldest first so we process & save state in correct order
+    # sinceId is inclusive on twitterapi.io, so drop the boundary tweet
+    if since_id:
+        tweets = [t for t in tweets if t.get("id") != since_id]
+
     return list(reversed(tweets))
+
+# ── Truth Social (Mastodon API) ───────────────────────────────────────────────
+
+TRUTH_BASE = "https://truthsocial.com"
+_truth_user_id_cache: dict[str, str] = {}
+
+def strip_html(text: str) -> str:
+    return re.sub(r"<[^>]+>", "", text).strip()
+
+def resolve_truth_user_id(username: str) -> str | None:
+    if username in _truth_user_id_cache:
+        return _truth_user_id_cache[username]
+    try:
+        resp = requests.get(
+            f"{TRUTH_BASE}/api/v1/accounts/lookup",
+            params={"acct": username},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        user_id = resp.json().get("id")
+        if user_id:
+            _truth_user_id_cache[username] = user_id
+        return user_id
+    except requests.RequestException as e:
+        log.error(f"Failed to resolve Truth Social user ID for @{username}: {e}")
+        return None
+
+def fetch_truth_posts(username: str, since_id: str | None) -> list[dict]:
+    user_id = resolve_truth_user_id(username)
+    if not user_id:
+        return []
+
+    params = {"limit": 20, "exclude_replies": "true", "exclude_reblogs": "true"}
+    if since_id:
+        params["since_id"] = since_id
+
+    try:
+        resp = requests.get(
+            f"{TRUTH_BASE}/api/v1/accounts/{user_id}/statuses",
+            params=params,
+            timeout=15,
+        )
+        resp.raise_for_status()
+        posts = resp.json()
+    except requests.RequestException as e:
+        log.error(f"Truth Social API request failed: {e}")
+        return []
+
+    # Mastodon returns newest first
+    return list(reversed(posts))
 
 # ── Claude AI classification ─────────────────────────────────────────────────
 
-SYSTEM_PROMPT = """You are a financial content classifier. 
-Your job is to determine whether a tweet is relevant to:
+SYSTEM_PROMPT = """You are a financial content classifier.
+Your job is to determine whether a post is relevant to:
 - Stock markets (any exchange, any country)
 - Individual company stocks or share prices
 - Earnings, revenue, profit/loss announcements
@@ -115,11 +166,7 @@ or
 
 Do not include any other text."""
 
-def is_finance_relevant(tweet_text: str) -> tuple[bool, str]:
-    """
-    Ask Claude to classify whether a tweet is finance/stock relevant.
-    Returns (is_relevant, reason).
-    """
+def is_finance_relevant(text: str) -> tuple[bool, str]:
     try:
         resp = requests.post(
             "https://api.anthropic.com/v1/messages",
@@ -132,14 +179,13 @@ def is_finance_relevant(tweet_text: str) -> tuple[bool, str]:
                 "model": "claude-haiku-4-5-20251001",
                 "max_tokens": 150,
                 "system": SYSTEM_PROMPT,
-                "messages": [{"role": "user", "content": tweet_text}],
+                "messages": [{"role": "user", "content": text}],
             },
             timeout=20,
         )
         resp.raise_for_status()
         content = resp.json()["content"][0]["text"].strip()
 
-        # Strip markdown code fences if present
         if content.startswith("```"):
             content = content.split("```")[1]
             if content.startswith("json"):
@@ -151,10 +197,9 @@ def is_finance_relevant(tweet_text: str) -> tuple[bool, str]:
 
     except Exception as e:
         log.warning(f"Claude classification failed: {e} — defaulting to keyword check")
-        return keyword_fallback(tweet_text)
+        return keyword_fallback(text)
 
 def keyword_fallback(text: str) -> tuple[bool, str]:
-    """Simple keyword fallback if Claude API is unavailable."""
     keywords = [
         "$", "stock", "share", "market", "ipo", "nasdaq", "nyse",
         "earnings", "revenue", "profit", "loss", "acquisition", "merger",
@@ -170,15 +215,7 @@ def keyword_fallback(text: str) -> tuple[bool, str]:
 
 # ── Telegram ─────────────────────────────────────────────────────────────────
 
-def send_telegram(tweet: dict, reason: str):
-    """Send a formatted tweet alert to the Telegram chat."""
-    username   = tweet.get("author", {}).get("userName", TARGET_USERNAME)
-    tweet_id   = tweet.get("id", "")
-    text       = tweet.get("text", "")
-    created_at = tweet.get("createdAt", "")
-    url        = f"https://x.com/{username}/status/{tweet_id}"
-
-    # Format timestamp nicely if available
+def send_telegram(username: str, post_id: str, text: str, created_at: str, url: str, reason: str, platform: str):
     ts = ""
     if created_at:
         try:
@@ -187,15 +224,17 @@ def send_telegram(tweet: dict, reason: str):
         except Exception:
             ts = created_at
 
+    platform_label = "🐦 X (Twitter)" if platform == "x" else "🟥 Truth Social"
+
     message = (
         f"📈 *Finance mention detected*\n"
-        f"👤 @{username}"
+        f"{platform_label}  ·  @{username}"
         + (f"  ·  {ts}" if ts else "") + "\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"{text}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"🤖 _{reason}_\n"
-        f"🔗 [View on X]({url})"
+        f"🔗 [View post]({url})"
     )
 
     try:
@@ -210,50 +249,88 @@ def send_telegram(tweet: dict, reason: str):
             timeout=15,
         )
         resp.raise_for_status()
-        log.info(f"✅ Sent to Telegram: {tweet_id}")
+        log.info(f"✅ Sent to Telegram: {post_id}")
     except requests.RequestException as e:
         log.error(f"Telegram send failed: {e}")
 
 # ── Main loop ────────────────────────────────────────────────────────────────
 
+def process_tweet(tweet: dict):
+    post_id   = tweet.get("id", "")
+    text      = tweet.get("text", "")
+    username  = tweet.get("author", {}).get("userName", TARGET_X_USERNAME)
+    created   = tweet.get("createdAt", "")
+    url       = f"https://x.com/{username}/status/{post_id}"
+    return post_id, text, username, created, url
+
+def process_truth_post(post: dict):
+    post_id  = post.get("id", "")
+    text     = strip_html(post.get("content", ""))
+    username = post.get("account", {}).get("username", TARGET_TS_USERNAME)
+    created  = post.get("created_at", "")
+    url      = post.get("url", f"{TRUTH_BASE}/@{username}/{post_id}")
+    return post_id, text, username, created, url
+
 def run():
-    log.info(f"🚀 Bot started — monitoring @{TARGET_USERNAME} every {POLL_INTERVAL}s")
+    sources = [f"X/@{TARGET_X_USERNAME}"]
+    if TARGET_TS_USERNAME:
+        sources.append(f"Truth Social/@{TARGET_TS_USERNAME}")
+    log.info(f"🚀 Bot started — monitoring {', '.join(sources)} every {POLL_INTERVAL}s")
 
     while True:
-        last_id = load_last_id()
-        log.info(f"Polling @{TARGET_USERNAME} (since_id={last_id})")
+        state = load_state()
 
-        tweets = fetch_recent_tweets(TARGET_USERNAME, last_id)
+        # ── Poll X ──────────────────────────────────────────────────────────
+        x_last_id = state.get("x_last_id")
+        log.info(f"Polling X/@{TARGET_X_USERNAME} (since_id={x_last_id})")
+        tweets = fetch_tweets(TARGET_X_USERNAME, x_last_id)
 
         if not tweets:
-            log.info("No new tweets.")
+            log.info("X: No new tweets.")
         else:
-            log.info(f"Found {len(tweets)} new tweet(s) to evaluate.")
+            log.info(f"X: Found {len(tweets)} new tweet(s).")
 
         for tweet in tweets:
-            tweet_id   = tweet.get("id", "")
-            tweet_text = tweet.get("text", "")
-
-            if not tweet_id or not tweet_text:
+            post_id, text, username, created, url = process_tweet(tweet)
+            if not post_id or not text:
                 continue
-
-            # Skip retweets (text starts with "RT @")
-            if tweet_text.startswith("RT @"):
-                log.info(f"  Skipping retweet {tweet_id}")
-                save_last_id(tweet_id)
-                continue
-
-            log.info(f"  Classifying tweet {tweet_id}: {tweet_text[:80]}…")
-            relevant, reason = is_finance_relevant(tweet_text)
-
-            if relevant:
-                log.info(f"  ✅ Relevant ({reason}) — sending to Telegram")
-                send_telegram(tweet, reason)
+            if text.startswith("RT @"):
+                log.info(f"  X: Skipping retweet {post_id}")
             else:
-                log.info(f"  ❌ Not relevant ({reason})")
+                log.info(f"  X: Classifying {post_id}: {text[:80]}…")
+                relevant, reason = is_finance_relevant(text)
+                if relevant:
+                    log.info(f"  X: ✅ Relevant ({reason}) — sending to Telegram")
+                    send_telegram(username, post_id, text, created, url, reason, "x")
+                else:
+                    log.info(f"  X: ❌ Not relevant ({reason})")
+            state["x_last_id"] = post_id
+            save_state(state)
 
-            # Always advance the cursor
-            save_last_id(tweet_id)
+        # ── Poll Truth Social ────────────────────────────────────────────────
+        if TARGET_TS_USERNAME:
+            ts_last_id = state.get("ts_last_id")
+            log.info(f"Polling Truth Social/@{TARGET_TS_USERNAME} (since_id={ts_last_id})")
+            posts = fetch_truth_posts(TARGET_TS_USERNAME, ts_last_id)
+
+            if not posts:
+                log.info("Truth Social: No new posts.")
+            else:
+                log.info(f"Truth Social: Found {len(posts)} new post(s).")
+
+            for post in posts:
+                post_id, text, username, created, url = process_truth_post(post)
+                if not post_id or not text:
+                    continue
+                log.info(f"  TS: Classifying {post_id}: {text[:80]}…")
+                relevant, reason = is_finance_relevant(text)
+                if relevant:
+                    log.info(f"  TS: ✅ Relevant ({reason}) — sending to Telegram")
+                    send_telegram(username, post_id, text, created, url, reason, "truth")
+                else:
+                    log.info(f"  TS: ❌ Not relevant ({reason})")
+                state["ts_last_id"] = post_id
+                save_state(state)
 
         time.sleep(POLL_INTERVAL)
 
