@@ -1,12 +1,14 @@
-# X → Telegram Finance Alert Bot
+# X + Truth Social → Telegram Finance Alert Bot
 
-Monitors a target X account and forwards any tweet mentioning stocks, companies,
+[![Deploy to Homeserver](https://github.com/theHeathLee/stockbot/actions/workflows/deploy.yml/badge.svg)](https://github.com/theHeathLee/stockbot/actions/workflows/deploy.yml)
+
+Monitors a target X account and Truth Social, forwarding any post mentioning stocks, companies,
 or financial markets to a Telegram chat — powered by Claude AI for smart classification.
 
 ## How it works
 
 ```
-Every 5 min → fetch new tweets from @TARGET → Claude classifies each one
+Every 15 min → fetch new posts from X/@TARGET + Truth Social → Claude classifies each one
     → if finance-relevant → send formatted alert to Telegram
 ```
 
