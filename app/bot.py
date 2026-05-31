@@ -10,6 +10,7 @@ import json
 import time
 import logging
 import requests
+import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -95,54 +96,38 @@ def fetch_tweets(username: str, since_id: str | None) -> list[dict]:
 
     return list(reversed(tweets))
 
-# ── Truth Social (Mastodon API) ───────────────────────────────────────────────
+# ── Truth Social via trumpstruth.org RSS ─────────────────────────────────────
 
-TRUTH_BASE = "https://truthsocial.com"
-_truth_user_id_cache: dict[str, str] = {}
+TRUTH_RSS_URL = "https://www.trumpstruth.org/feed"
+TRUTH_NS = "https://truthsocial.com/ns"
 
 def strip_html(text: str) -> str:
     return re.sub(r"<[^>]+>", "", text).strip()
 
-def resolve_truth_user_id(username: str) -> str | None:
-    if username in _truth_user_id_cache:
-        return _truth_user_id_cache[username]
+def fetch_truth_posts(since_id: str | None) -> list[dict]:
     try:
-        resp = requests.get(
-            f"{TRUTH_BASE}/api/v1/accounts/lookup",
-            params={"acct": username},
-            timeout=15,
-        )
+        resp = requests.get(TRUTH_RSS_URL, timeout=15)
         resp.raise_for_status()
-        user_id = resp.json().get("id")
-        if user_id:
-            _truth_user_id_cache[username] = user_id
-        return user_id
-    except requests.RequestException as e:
-        log.error(f"Failed to resolve Truth Social user ID for @{username}: {e}")
-        return None
-
-def fetch_truth_posts(username: str, since_id: str | None) -> list[dict]:
-    user_id = resolve_truth_user_id(username)
-    if not user_id:
+        root = ET.fromstring(resp.content)
+    except (requests.RequestException, ET.ParseError) as e:
+        log.error(f"Truth Social RSS fetch failed: {e}")
         return []
 
-    params = {"limit": 20, "exclude_replies": "true", "exclude_reblogs": "true"}
-    if since_id:
-        params["since_id"] = since_id
+    posts = []
+    for item in root.findall(".//item"):
+        original_id  = item.findtext(f"{{{TRUTH_NS}}}originalId", "")
+        original_url = item.findtext(f"{{{TRUTH_NS}}}originalUrl", "")
+        text         = strip_html(item.findtext("description", ""))
+        pub_date     = item.findtext("pubDate", "")
 
-    try:
-        resp = requests.get(
-            f"{TRUTH_BASE}/api/v1/accounts/{user_id}/statuses",
-            params=params,
-            timeout=15,
-        )
-        resp.raise_for_status()
-        posts = resp.json()
-    except requests.RequestException as e:
-        log.error(f"Truth Social API request failed: {e}")
-        return []
+        if not original_id or not text:
+            continue
+        if since_id and int(original_id) <= int(since_id):
+            continue
 
-    # Mastodon returns newest first
+        posts.append({"id": original_id, "text": text, "url": original_url, "created_at": pub_date})
+
+    # RSS is newest-first; process oldest-first
     return list(reversed(posts))
 
 # ── Claude AI classification ─────────────────────────────────────────────────
@@ -261,14 +246,6 @@ def process_tweet(tweet: dict):
     url       = f"https://x.com/{username}/status/{post_id}"
     return post_id, text, username, created, url
 
-def process_truth_post(post: dict):
-    post_id  = post.get("id", "")
-    text     = strip_html(post.get("content", ""))
-    username = post.get("account", {}).get("username", TARGET_TS_USERNAME)
-    created  = post.get("created_at", "")
-    url      = post.get("url", f"{TRUTH_BASE}/@{username}/{post_id}")
-    return post_id, text, username, created, url
-
 def run():
     sources = [f"X/@{TARGET_X_USERNAME}"]
     if TARGET_TS_USERNAME:
@@ -308,8 +285,8 @@ def run():
         # ── Poll Truth Social ────────────────────────────────────────────────
         if TARGET_TS_USERNAME:
             ts_last_id = state.get("ts_last_id")
-            log.info(f"Polling Truth Social/@{TARGET_TS_USERNAME} (since_id={ts_last_id})")
-            posts = fetch_truth_posts(TARGET_TS_USERNAME, ts_last_id)
+            log.info(f"Polling Truth Social/@realDonaldTrump (since_id={ts_last_id})")
+            posts = fetch_truth_posts(ts_last_id)
 
             if not posts:
                 log.info("Truth Social: No new posts.")
@@ -317,16 +294,22 @@ def run():
                 log.info(f"Truth Social: Found {len(posts)} new post(s).")
 
             for post in posts:
-                post_id, text, username, created, url = process_truth_post(post)
-                if not post_id or not text:
-                    continue
-                log.info(f"  TS: Classifying {post_id}: {text[:80]}…")
-                relevant, reason = is_finance_relevant(text)
-                if relevant:
-                    log.info(f"  TS: ✅ Relevant ({reason}) — sending to Telegram")
-                    send_telegram(username, post_id, text, created, url, reason, "truth")
+                post_id = post["id"]
+                text    = post["text"]
+                url     = post["url"]
+                created = post["created_at"]
+
+                if text.startswith("RT @"):
+                    log.info(f"  TS: Skipping retruth {post_id}")
                 else:
-                    log.info(f"  TS: ❌ Not relevant ({reason})")
+                    log.info(f"  TS: Classifying {post_id}: {text[:80]}…")
+                    relevant, reason = is_finance_relevant(text)
+                    if relevant:
+                        log.info(f"  TS: ✅ Relevant ({reason}) — sending to Telegram")
+                        send_telegram("realDonaldTrump", post_id, text, created, url, reason, "truth")
+                    else:
+                        log.info(f"  TS: ❌ Not relevant ({reason})")
+
                 state["ts_last_id"] = post_id
                 save_state(state)
 
