@@ -133,14 +133,20 @@ def fetch_truth_posts(since_id: str | None) -> list[dict]:
 # ── Claude AI classification ─────────────────────────────────────────────────
 
 SYSTEM_PROMPT = """You are a financial content classifier.
-Your job is to determine whether a post is relevant to:
+Your job is to determine whether a post is likely to move financial markets or affect investor sentiment. Flag it if it relates to:
 - Stock markets (any exchange, any country)
 - Individual company stocks or share prices
 - Earnings, revenue, profit/loss announcements
 - IPOs, mergers, acquisitions, or corporate actions
-- Economic indicators that directly affect markets (interest rates, inflation, GDP)
+- Economic indicators (interest rates, inflation, GDP, unemployment)
 - Specific named companies (even without explicit stock mention)
 - Cryptocurrency markets or tokens
+- Tariffs, trade deals, sanctions, or export controls
+- Wars, military conflicts, or geopolitical tensions that could disrupt markets or supply chains
+- Energy markets (oil, gas, commodities) or supply chain disruptions
+- Central bank policy or government spending decisions
+
+Use your judgement — if a reasonable investor would consider this market-moving news, flag it.
 
 Respond ONLY with a JSON object in this exact format:
 {"relevant": true, "reason": "brief reason"}
