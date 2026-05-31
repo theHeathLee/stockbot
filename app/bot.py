@@ -75,8 +75,6 @@ def fetch_tweets(username: str, since_id: str | None) -> list[dict]:
         return []
 
     params = {"userId": user_id, "count": 20}
-    if since_id:
-        params["sinceId"] = since_id
 
     try:
         resp = requests.get(
@@ -91,9 +89,9 @@ def fetch_tweets(username: str, since_id: str | None) -> list[dict]:
         log.error(f"Twitter API request failed: {e}")
         return []
 
-    # sinceId is inclusive on twitterapi.io, so drop the boundary tweet
+    # sinceId is ignored by twitterapi.io, so filter client-side
     if since_id:
-        tweets = [t for t in tweets if t.get("id") != since_id]
+        tweets = [t for t in tweets if int(t.get("id", 0)) > int(since_id)]
 
     return list(reversed(tweets))
 
