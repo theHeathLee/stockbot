@@ -1,6 +1,7 @@
 # X + Truth Social → Telegram Finance Alert Bot
 
 [![Deploy to Homeserver](https://github.com/theHeathLee/stockbot/actions/workflows/deploy.yml/badge.svg)](https://github.com/theHeathLee/stockbot/actions/workflows/deploy.yml)
+![healthchecks.io](https://healthchecks.io/badge/fb1a6e79-a41a-433f-b85c-c37075/CSSv5YOw-2.svg)
 
 Monitors a target X account and Truth Social, forwarding any post mentioning stocks, companies,
 or financial markets to a Telegram chat — powered by Claude AI for smart classification.
