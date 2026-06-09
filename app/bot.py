@@ -26,6 +26,8 @@ log = logging.getLogger(__name__)
 ANTHROPIC_API_KEY  = os.environ["ANTHROPIC_API_KEY"]
 TELEGRAM_TOKEN     = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID   = os.environ["TELEGRAM_CHAT_ID"]
+TELEGRAM_ADMIN_ID  = os.getenv("TELEGRAM_ADMIN_CHAT_ID", "")
+HEALTHCHECK_URL    = os.getenv("HEALTHCHECK_URL", "")
 POLL_INTERVAL      = int(os.getenv("POLL_INTERVAL_SECONDS", "900"))
 
 STATE_FILE = Path("/data/state.json")
@@ -189,42 +191,76 @@ def send_telegram(post_id: str, text: str, created_at: str, url: str, reason: st
     except requests.RequestException as e:
         log.error(f"Telegram send failed: {e}")
 
+# ── Monitoring ───────────────────────────────────────────────────────────────
+
+def ping_healthcheck():
+    if not HEALTHCHECK_URL:
+        return
+    try:
+        requests.get(HEALTHCHECK_URL, timeout=10)
+    except Exception as e:
+        log.warning(f"Healthcheck ping failed: {e}")
+
+def alert_admin(message: str):
+    if not TELEGRAM_ADMIN_ID:
+        return
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_ADMIN_ID, "text": f"🚨 *stockbot alert*\n{message}", "parse_mode": "Markdown"},
+            timeout=10,
+        )
+    except Exception:
+        pass
+
 # ── Main loop ────────────────────────────────────────────────────────────────
 
 def run():
     log.info(f"🚀 Bot started — monitoring Truth Social/@realDonaldTrump every {POLL_INTERVAL}s")
+    alert_admin("🟢 Bot started successfully.")
+    consecutive_errors = 0
 
     while True:
-        state = load_state()
-        ts_last_id = state.get("ts_last_id")
+        try:
+            state = load_state()
+            ts_last_id = state.get("ts_last_id")
 
-        log.info(f"Polling Truth Social/@realDonaldTrump (since_id={ts_last_id})")
-        posts = fetch_truth_posts(ts_last_id)
+            log.info(f"Polling Truth Social/@realDonaldTrump (since_id={ts_last_id})")
+            posts = fetch_truth_posts(ts_last_id)
 
-        if not posts:
-            log.info("No new posts.")
-        else:
-            log.info(f"Found {len(posts)} new post(s).")
-
-        for post in posts:
-            post_id = post["id"]
-            text    = post["text"]
-            url     = post["url"]
-            created = post["created_at"]
-
-            if text.startswith("RT @"):
-                log.info(f"  Skipping retruth {post_id}")
+            if not posts:
+                log.info("No new posts.")
             else:
-                log.info(f"  Classifying {post_id}: {text[:80]}…")
-                relevant, reason = is_finance_relevant(text)
-                if relevant:
-                    log.info(f"  ✅ Relevant ({reason}) — sending to Telegram")
-                    send_telegram(post_id, text, created, url, reason)
-                else:
-                    log.info(f"  ❌ Not relevant ({reason})")
+                log.info(f"Found {len(posts)} new post(s).")
 
-            state["ts_last_id"] = post_id
-            save_state(state)
+            for post in posts:
+                post_id = post["id"]
+                text    = post["text"]
+                url     = post["url"]
+                created = post["created_at"]
+
+                if text.startswith("RT @"):
+                    log.info(f"  Skipping retruth {post_id}")
+                else:
+                    log.info(f"  Classifying {post_id}: {text[:80]}…")
+                    relevant, reason = is_finance_relevant(text)
+                    if relevant:
+                        log.info(f"  ✅ Relevant ({reason}) — sending to Telegram")
+                        send_telegram(post_id, text, created, url, reason)
+                    else:
+                        log.info(f"  ❌ Not relevant ({reason})")
+
+                state["ts_last_id"] = post_id
+                save_state(state)
+
+            consecutive_errors = 0
+            ping_healthcheck()
+
+        except Exception as e:
+            consecutive_errors += 1
+            log.error(f"Poll cycle failed: {e}")
+            if consecutive_errors >= 3:
+                alert_admin(f"❌ Bot has failed {consecutive_errors} polls in a row:\n`{e}`")
 
         time.sleep(POLL_INTERVAL)
 
